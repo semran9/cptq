@@ -46,13 +46,13 @@ def evaluate(model, test_texts):
     total_tokens = 0
     
     # Load tokenizer if not already loaded
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-1.5B")
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
     
     with torch.no_grad():
         for text in tqdm(test_texts, desc="Evaluating perplexity"):
             # Tokenize text
-            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            # inputs = tokenizer(text, return_tensors="pt", truncation=True, max_new_tokens=512)
+            inputs = {k: v.to(model.device) for k, v in text.items()}
             
             # Get model outputs
             outputs = model(**inputs, labels=inputs["input_ids"])
@@ -68,7 +68,7 @@ def evaluate(model, test_texts):
     
     return perplexity
 
-def replace_linear_layers(model, steps=5000, batch=128):
+def replace_linear_layers(model, steps=250, batch=128):
     """
     Replace all Linear layers in the model with QuantizedLinear layers.
     
@@ -83,7 +83,7 @@ def replace_linear_layers(model, steps=5000, batch=128):
     # Iterate through named modules
     for name, module in model.named_children():
         # If module is a Linear layer, replace it
-        if isinstance(module, nn.Linear) and name not in "lm_head":
+        if isinstance(module, nn.Linear) and (name not in "lm_head"and "down" not in name):
             setattr(model, name, QuantizedLinear(module, steps=steps, batch=batch))
             replaced_count += 1
             print(f"Replaced linear layer {name}")
@@ -102,7 +102,7 @@ def quantize_and_evaluate():
     # Load calibration dataset from HuggingFace
     from datasets import load_dataset
     # Create tokenizer for calibration data
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-1.5B")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
     
     # Create calibration dataset
     class TextDataset(torch.utils.data.Dataset):
@@ -110,7 +110,7 @@ def quantize_and_evaluate():
             self.texts = texts
             self.tokenizer = tokenizer
             self.max_length = max_length
-            
+            #tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         def __len__(self):
             return len(self.texts)
             
@@ -152,8 +152,8 @@ def quantize_and_evaluate():
     # Load pretrained model
     print("\nLoading pretrained Qwen model...")
     original_model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen2-1.5B", 
-        torch_dtype=torch.float16,
+        "Qwen/Qwen2-0.5B", 
+        torch_dtype=torch.bfloat16,
         device_map="auto"
     )
     original_model.eval()
@@ -164,8 +164,8 @@ def quantize_and_evaluate():
 
     # Evaluate both models
     print("\nEvaluating models...")
-    orig_acc = evaluate(original_model, test_loader, device)
-    quant_acc = evaluate(quantized_model, test_loader, device)
+    orig_acc = evaluate(original_model, test_loader)/100
+    quant_acc = evaluate(quantized_model, test_loader)/100
 
     # Calculate model sizes
     orig_size = sum(p.numel() * p.element_size() for p in original_model.parameters()) / (1024 * 1024)
@@ -174,27 +174,13 @@ def quantize_and_evaluate():
     # Print results
     print("\nResults:")
     print(f"Original Model:")
-    print(f"  Accuracy: {orig_acc:.2f}%")
+    print(f"  Ppl: {orig_acc:.2f}")
     print(f"  Model size: {orig_size:.2f}MB")
 
     print(f"\nQuantized Model:")
-    print(f"  Accuracy: {quant_acc:.2f}%")
+    print(f"  Ppl: {quant_acc:.2f}")
     print(f"  Model size: {quant_size:.2f}MB")
     print(f"  Size reduction: {(1 - quant_size/orig_size)*100:.1f}%")
-
-    # Analyze quantization statistics
-    print("\nQuantization Statistics:")
-    for idx, layer in enumerate(quantized_model.quantized_layers):
-        with torch.no_grad():
-            quantized_weight, _ = layer.quantizer(layer.weight)
-            sparsity = torch.mean((torch.abs(quantized_weight) < 1e-6).float()).item()
-            pos_weights = torch.mean((quantized_weight > 1e-6).float()).item()
-            neg_weights = torch.mean((quantized_weight < -1e-6).float()).item()
-
-            print(f"\nLayer {idx+1}:")
-            print(f"Sparsity: {sparsity:.2%}")
-            print(f"Positive weights: {pos_weights:.2%}")
-            print(f"Negative weights: {neg_weights:.2%}")
 
     return original_model, quantized_model
 
