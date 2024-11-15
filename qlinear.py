@@ -21,6 +21,7 @@ class MatrixMultApproximator(nn.Module):
         self.theta = nn.Parameter(torch.tensor(0.2, device=device))
         # self.bias = nn.Parameter(torch.tensor(1.0, device=device))
         self.bias = nn.Parameter(torch.zeros(fl, device=device).unsqueeze(0) + 0.5)
+        self.T = None
 
     def forward(self, V, V_p, X):
         """
@@ -30,23 +31,26 @@ class MatrixMultApproximator(nn.Module):
             X: Input matrix [batch_size, in_features]
         """
         # Compute taT 
-        T = (V - torch.cos(self.theta.T) * V_p) / torch.sin(self.theta)
-        T = T + (weight_quant(T) - T).detach()
+        if self.T == None:
+            T = (V - torch.cos(self.theta.T) * V_p) / torch.sin(self.theta)
+            self.T = nn.Parameter(T)
+        
+        T = self.T + (weight_quant(self.T) - self.T).detach()
         
         # Compute matrix products for the entire batch at once
         X_T = torch.matmul(X, T.T)  # [batch_size, out_features]
         V_p_X = torch.matmul(X, V_p.T)  # [batch_size, out_features]
         
         # Get signs for all outputs at once
-        sign = X_T + (torch.sign(X_T) - X_T).detach()  # [batch_size, out_features]
+        sign = torch.tanh(X_T) # + (torch.sign(X_T) - X_T).detach()  # [batch_size, out_features]
         
         # Compute approximation for all outputs
         appx = torch.cos(self.theta) * V_p_X + sign * self.bias #* torch.sin(torch.arccos(V_p_X))
         return appx
 
     def return_parameters(self, V, V_p):
-        T = (V - V_p * torch.cos(self.theta)) / torch.sin(self.theta)
-        return weight_quant(T), self.theta, self.bias
+        # T = (V - V_p * torch.cos(self.theta)) / torch.sin(self.theta)
+        return weight_quant(self.T), self.theta, self.bias
 
 class QuantizedLinear(nn.Linear):
     def __init__(self, input_layer, steps = 1000, batch = 512):
