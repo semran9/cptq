@@ -12,6 +12,7 @@ import time
 from contextlib import contextmanager
 import torch.amp as amp  # Updated import
 import copy
+from qlinear import QuantizedLinear
 
 @dataclass
 class QuantConfig:
@@ -37,163 +38,6 @@ def gpu_memory_check(name: str):
         print(f"{name} memory change: {(mem_after - mem_before) / 1024**2:.2f}MB")
     else:
         yield
-
-class BiOrthogonalRotation(nn.Module):
-    def __init__(self, rows, cols):
-        super().__init__()
-        # Initialize with small random values
-        self.U_skew = nn.Parameter(torch.randn(rows, rows) * 0.01)
-        self.V_skew = nn.Parameter(torch.randn(cols, cols) * 0.01)
-
-    def get_orthogonal(self, A_skew):
-        A_skew = (A_skew - A_skew.t()) / 2
-        I = torch.eye(A_skew.shape[0], device=A_skew.device)
-        return torch.matmul(I + A_skew, torch.inverse(I - A_skew))
-
-    def forward(self):
-        U = self.get_orthogonal(self.U_skew)
-        V = self.get_orthogonal(self.V_skew)
-        return U, V
-
-class LayerTernaryQuantizer(nn.Module):
-    def __init__(self, weight_shape, threshold=0.05):
-        super().__init__()
-        self.rotation = BiOrthogonalRotation(weight_shape[0], weight_shape[1])
-        self.threshold = threshold
-        self.register_buffer('scale', torch.ones(1))
-
-    def normalize_matrix(self, M):
-        row_norms = torch.sqrt(torch.sum(M ** 2, dim=1, keepdim=True))
-        row_norms = torch.where(row_norms > 0, row_norms, torch.ones_like(row_norms))
-        self.scale = row_norms
-        return M / (row_norms + 1e-8)
-
-    def quantize(self, M):
-        return torch.where(torch.abs(M) > self.threshold,
-                         torch.sign(M),
-                         torch.zeros_like(M))
-
-    def forward(self, M):
-        M_norm = self.normalize_matrix(M)
-        U, V = self.rotation()
-        V = V.to(M.dtype)
-        M_norm = M_norm.to(M.dtype)
-        M_rotated = torch.matmul(torch.matmul(U.to(M.dtype), M_norm), V.t())
-        M_quantized = self.quantize(M_rotated)
-        M_quantized = M_quantized * self.scale
-        # print(M_quantized)
-        return M_quantized, (U, V)
-
-class QuantizedLinear(nn.Module):
-    def __init__(self, original_layer):
-        super().__init__()
-        self.in_features = original_layer.in_features
-        self.out_features = original_layer.out_features
-
-        # Keep original weights frozen
-        self.register_buffer('weight', original_layer.weight.data.clone())
-        if original_layer.bias is not None:
-            self.register_buffer('bias', original_layer.bias.data.clone())
-        else:
-            self.register_buffer('bias', None)
-
-        # Only the rotation parameters are trainable
-        self.quantizer = LayerTernaryQuantizer(self.weight.shape).to(original_layer.weight.device)
-
-        # Initialize quantized weights
-        with torch.no_grad():
-            self.quantized_weight, _ = self.quantizer(self.weight)
-
-    def forward(self, x):
-        if self.training:
-            # During calibration
-            quantized_weight, _ = self.quantizer(self.weight)
-        else:
-            # During inference
-            quantized_weight = self.quantized_weight
-        return F.linear(x, quantized_weight, self.bias)
-
-    def update_quantized_weight(self):
-        with torch.no_grad():
-            self.quantized_weight, _ = self.quantizer(self.weight)
-
-class QuantizedBlock(nn.Module):
-    def __init__(self, original_block):
-        super().__init__()
-        for name, module in original_block.named_children():
-            if isinstance(module, nn.Linear):
-                quantized_layer = QuantizedLinear(module)
-                quantized_layer.is_training = True
-                setattr(self, name, quantized_layer)
-            else:
-                setattr(self, name, module)
-        self.block = original_block
-
-def quantize_block(original_block):
-    for name, module in original_block.named_children():
-        if isinstance(module, nn.Linear):
-            # Replace with quantized linear layer
-            quantized_layer = QuantizedLinear(module).to(module.weight.device)
-            quantized_layer.is_training = True
-            setattr(original_block, name, quantized_layer)
-        else:
-            # Recursively quantize submodules, if any
-            quantize_block(module)
-    # return original_block
-
-def calibrate_rotations(teacher, student, idx, calib_loader, device, epochs=5):
-    """Calibrate rotation matrices using a small calibration set"""
-    block = student.model.layers[idx]
-    student.zero_grad()
-    optimizer = torch.optim.Adam(block.parameters(), lr=0.001)
-
-    best_loss = float('inf')
-    best_state = None
-
-    for epoch in range(epochs):
-        student.train()  # Enable training mode for rotation updates
-        total_loss = 0
-
-        for batch in tqdm(calib_loader, desc=f'Calibration Epoch {epoch+1}'):
-            batch = {k: v.to(teacher.device) for k, v in batch.items()}
-            optimizer.zero_grad()
-
-            # Get teacher output from next block
-            with torch.no_grad():
-                teacher_output = teacher(**batch, output_hidden_states = True)
-
-            # Get current block output 
-            student_output = student(**batch, output_hidden_states = True)
-
-            for count, (sh, th) in enumerate(zip(student_output.hidden_states, teacher_output.hidden_states)):
-                # print(count)
-                if count >= idx+1:
-                    # Calculate MSE loss between outputs
-                    loss = F.mse_loss(sh, th)
-                    # print(loss)
-                    pass
-            
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            
-
-        avg_loss = total_loss / len(calib_loader)
-        print(f'Epoch {epoch+1}, Average Loss: {avg_loss:.4f}')
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            best_state = {name: param.clone() for name, param in block.state_dict().items()}
-
-    # Restore best state
-    block.load_state_dict(best_state)
-
-    # Update quantized weights for inference
-    for name, layer in block.named_modules():
-        if isinstance(layer, QuantizedLinear):
-            layer.update_quantized_weight()
-    block.eval()  # Set to eval mode for inference
 
 def evaluate(model, test_texts):
     """Evaluate model perplexity on test texts"""
@@ -224,6 +68,32 @@ def evaluate(model, test_texts):
     
     return perplexity
 
+def replace_linear_layers(model, steps=5000, batch=128):
+    """
+    Replace all Linear layers in the model with QuantizedLinear layers.
+    
+    Args:
+        model: The PyTorch model to modify
+        steps: Number of calibration steps for each QuantizedLinear layer
+        batch: Batch size for calibration
+    """
+    # Keep track of replaced layers
+    replaced_count = 0
+    
+    # Iterate through named modules
+    for name, module in model.named_children():
+        # If module is a Linear layer, replace it
+        if isinstance(module, nn.Linear) and name not in "lm_head":
+            setattr(model, name, QuantizedLinear(module, steps=steps, batch=batch))
+            replaced_count += 1
+            print(f"Replaced linear layer {name}")
+        # If module has children, recursively replace their layers
+        elif len(list(module.children())) > 0:
+            replaced_count += replace_linear_layers(module, steps=steps, batch=batch)
+    
+    return replaced_count
+
+
 def quantize_and_evaluate():
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -231,26 +101,11 @@ def quantize_and_evaluate():
 
     # Load calibration dataset from HuggingFace
     from datasets import load_dataset
-    
-    print("Loading calibration dataset...")
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-    
-    # Convert text to list of samples
-    calib_texts = []
-    for item in dataset:
-        # Split into chunks of reasonable length
-        text = item['text']
-        if len(text.strip()) > 0:  # Skip empty lines
-            calib_texts.append(text)
-            if len(calib_texts) >= 1000:  # Limit number of samples
-                break
-                
-    print(f"Loaded {len(calib_texts)} text samples for calibration")
     # Create tokenizer for calibration data
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-1.5B")
     
     # Create calibration dataset
-    class CalibrationDataset(torch.utils.data.Dataset):
+    class TextDataset(torch.utils.data.Dataset):
         def __init__(self, texts, tokenizer, max_length=512):
             self.texts = texts
             self.tokenizer = tokenizer
@@ -272,18 +127,6 @@ def quantize_and_evaluate():
                 'input_ids': encodings['input_ids'].squeeze(),
                 'attention_mask': encodings['attention_mask'].squeeze()
             }
-    
-    # Create dataloader
-    calib_dataset = CalibrationDataset(calib_texts, tokenizer)
-    calib_loader = torch.utils.data.DataLoader(
-        calib_dataset,
-        batch_size=8,  # Adjust based on GPU memory
-        shuffle=True,
-        num_workers=2
-    )
-    
-    print(f"Created calibration dataloader with {len(calib_loader)} batches")
-
     # Load test dataset from C4
     print("Loading test dataset from C4...")
     test_dataset = load_dataset("c4", "en", split="validation", streaming=True)
@@ -296,7 +139,7 @@ def quantize_and_evaluate():
     print(f"Loaded {len(test_texts)} text samples for testing")
 
     # Create test dataset
-    test_dataset = CalibrationDataset(test_texts, tokenizer)
+    test_dataset = TextDataset(test_texts, tokenizer)
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=8,  # Same batch size as calibration for consistency
@@ -317,15 +160,7 @@ def quantize_and_evaluate():
     print("Model loaded successfully")
 
     quantized_model = copy.deepcopy(original_model)
-    for idx, layer in enumerate(quantized_model.model.layers):
-        # Quantize layer using quantized block
-        quantize_block(
-            layer
-        )
-        # print(quantized_model)
-        # Calibrate rotations
-        print("\nCalibrating rotation matrices...")
-        calibrate_rotations(original_model, quantized_model, idx, calib_loader, device)
+    count = replace_linear_layers(quantized_model)
 
     # Evaluate both models
     print("\nEvaluating models...")
