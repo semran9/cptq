@@ -134,7 +134,7 @@ def quantize_and_evaluate():
             }
     # Load calibration dataset
     print("Loading calibration dataset...")
-    calibration_dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="train", streaming=True)
+    calibration_dataset = load_dataset("c4", "en", split="train", streaming=True)
     calibration_texts = []
     for item in calibration_dataset:
         if len(item['text'].strip()) > 0:
@@ -147,7 +147,7 @@ def quantize_and_evaluate():
     calibration_dataset = TextDataset(calibration_texts, tokenizer)
     calibration_loader = torch.utils.data.DataLoader(
         calibration_dataset,
-        batch_size=128,  # Batch size for calibration
+        batch_size=64,  # Batch size for calibration
         shuffle=True,  # Shuffle for randomness
         num_workers=2
     )
@@ -177,14 +177,15 @@ def quantize_and_evaluate():
     # Load pretrained model
     print("\nLoading pretrained Qwen model...")
     original_model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen2-0.5B", 
-        torch_dtype=torch.bfloat16,
+        "Qwen/Qwen2-1.5B", 
+        torch_dtype=torch.float32,
         device_map="auto"
     )
     original_model.eval()
     print("Model loaded successfully")
 
     quantized_model = copy.deepcopy(original_model)
+    # quantized_model = quantized_model.to(device)
     count = replace_linear_layers(quantized_model)
 
      # Take the first batch from the calibration set
@@ -195,6 +196,7 @@ def quantize_and_evaluate():
     # Run the first batch through the quantized model to calibrate it
     with torch.no_grad():
         quantized_model.eval()
+        # print(input_ids.device)
         outputs = quantized_model(input_ids, attention_mask=attention_mask, labels=input_ids)
         loss = outputs.loss
         print(f"Calibration loss: {loss.item()}")

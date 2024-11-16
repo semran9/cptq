@@ -62,7 +62,7 @@ class QuantizedLinear(nn.Module):
             return
             
         # Compute Hessian approximation
-        self.H = self.compute_H(x_cal)
+        self.H = self.compute_H(x_cal.reshape(x_cal.shape[0]*x_cal.shape[1], x_cal.shape[-1]))
         
         # Get original weights
         W = self.weight.data
@@ -110,7 +110,12 @@ class QuantizedLinear(nn.Module):
         
         # Combine quantized norms and directions
         self.quantized_weight = self.quantized_directions * self.quantized_norms.unsqueeze(1)
+        self.quantized_weight = nn.Parameter(self.quantized_weight.to(self.weight.device))
+        print(self.quantized_weight.device)
+        self.bias =  nn.Parameter(self.bias.to(self.weight.device))
         self.quantized = True
+        del self.H
+        del self.weight
     
     def quantize_direction(self, w: torch.Tensor) -> torch.Tensor:
         """Quantize a normalized direction vector."""
@@ -137,7 +142,7 @@ class QuantizedLinear(nn.Module):
         """Forward pass using quantized or full-precision weights."""
         if not self.quantized:
             self.quantize_weight(x)
-        weight = self.quantized_weight if self.quantized else self.weight
+        weight = self.quantized_weight
         return F.linear(x, weight, self.bias)
 
 def test_directional_quantization():
