@@ -83,8 +83,13 @@ def replace_linear_layers(model, steps=250, batch=128):
     # Iterate through named modules
     for name, module in model.named_children():
         # If module is a Linear layer, replace it
-        if isinstance(module, nn.Linear) and (name not in "lm_head"and "down" not in name):
-            setattr(model, name, QuantizedLinear(module, steps=steps, batch=batch))
+        if isinstance(module, nn.Linear) and (name not in "lm_head"):
+            weight = nn.Parameter(module.weight)
+            layer = QuantizedLinear(weight.shape[1], weight.shape[0])
+            layer.weight = weight
+            if module.bias is not None:
+                    layer.bias = module.bias
+            setattr(model, name, layer)
             replaced_count += 1
             print(f"Replaced linear layer {name}")
         # If module has children, recursively replace their layers
@@ -127,6 +132,26 @@ def quantize_and_evaluate():
                 'input_ids': encodings['input_ids'].squeeze(),
                 'attention_mask': encodings['attention_mask'].squeeze()
             }
+    # Load calibration dataset
+    print("Loading calibration dataset...")
+    calibration_dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="train", streaming=True)
+    calibration_texts = []
+    for item in calibration_dataset:
+        if len(item['text'].strip()) > 0:
+            calibration_texts.append(item['text'])
+            if len(calibration_texts) >= 128:  # Collect 1000 samples for calibration
+                break
+    print(f"Loaded {len(calibration_texts)} text samples for calibration")
+
+    # Create calibration dataset
+    calibration_dataset = TextDataset(calibration_texts, tokenizer)
+    calibration_loader = torch.utils.data.DataLoader(
+        calibration_dataset,
+        batch_size=128,  # Batch size for calibration
+        shuffle=True,  # Shuffle for randomness
+        num_workers=2
+    )
+    print(f"Created calibration dataloader with {len(calibration_loader)} batches")
     # Load test dataset from C4
     print("Loading test dataset from C4...")
     test_dataset = load_dataset("c4", "en", split="validation", streaming=True)
@@ -161,6 +186,18 @@ def quantize_and_evaluate():
 
     quantized_model = copy.deepcopy(original_model)
     count = replace_linear_layers(quantized_model)
+
+     # Take the first batch from the calibration set
+    first_batch = next(iter(calibration_loader))
+    input_ids = first_batch['input_ids'].to(device)
+    attention_mask = first_batch['attention_mask'].to(device)
+
+    # Run the first batch through the quantized model to calibrate it
+    with torch.no_grad():
+        quantized_model.eval()
+        outputs = quantized_model(input_ids, attention_mask=attention_mask, labels=input_ids)
+        loss = outputs.loss
+        print(f"Calibration loss: {loss.item()}")
 
     # Evaluate both models
     print("\nEvaluating models...")
